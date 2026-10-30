@@ -300,6 +300,57 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("rejects a short auth password and accepts a trimmed valid one", () =>
+    Effect.gen(function* () {
+      const secret = "short";
+      const baseDir = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-cli-auth-password-" })),
+      );
+      const flags = {
+        mode: Option.some("web" as const),
+        port: Option.some(8788),
+        host: Option.none<string>(),
+        baseDir: Option.some(baseDir),
+        cwd: Option.none<string>(),
+        devUrl: Option.some(new URL("http://127.0.0.1:5173")),
+        noBrowser: Option.none<boolean>(),
+        bootstrapFd: Option.none<number>(),
+        autoBootstrapProjectFromCwd: Option.none<boolean>(),
+        logWebSocketEvents: Option.none<boolean>(),
+        tailscaleServeEnabled: Option.none<boolean>(),
+        tailscaleServePort: Option.none<number>(),
+      };
+      const invalid = yield* resolveServerConfig(flags, Option.none()).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_AUTH_PASSWORD: secret } })),
+            NetService.layer,
+          ),
+        ),
+        Effect.flip,
+      );
+      const valid = yield* resolveServerConfig(flags, Option.none()).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({
+                env: { T3CODE_AUTH_PASSWORD: "  server-password-value  " },
+              }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      expect(String(invalid)).not.toContain(secret);
+      expect(valid.authPassword).toBeDefined();
+      if (valid.authPassword === undefined) {
+        return yield* Effect.die("Expected auth password.");
+      }
+      expect(Redacted.value(valid.authPassword)).toBe("server-password-value");
+    }),
+  );
+
   it.effect("preserves explicit false CLI boolean flags over env and bootstrap values", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;

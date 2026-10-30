@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -75,6 +76,27 @@ it.layer(NodeServices.layer)("EnvironmentAuthPolicy.layer", (it) => {
           mode: "web",
           host: "127.0.0.1",
           port: 3773,
+        }),
+      ),
+    ),
+  );
+
+  it.effect("advertises password login only when a password is configured", () =>
+    Effect.gen(function* () {
+      const omitting = yield* EnvironmentAuthPolicy.EnvironmentAuthPolicy;
+      expect((yield* omitting.getDescriptor()).passwordLogin).toBeUndefined();
+    }).pipe(Effect.provide(layerEnvironmentAuthPolicy({ mode: "web" }))),
+  );
+
+  it.effect("sets passwordLogin when the server has a configured password", () =>
+    Effect.gen(function* () {
+      const policy = yield* EnvironmentAuthPolicy.EnvironmentAuthPolicy;
+      expect((yield* policy.getDescriptor()).passwordLogin).toBe(true);
+    }).pipe(
+      Effect.provide(
+        layerEnvironmentAuthPolicy({
+          mode: "web",
+          authPassword: Redacted.make("a-configured-password"),
         }),
       ),
     ),

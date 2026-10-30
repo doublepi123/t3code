@@ -38,6 +38,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
 import * as EnvironmentAuthPolicy from "./EnvironmentAuthPolicy.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
+import { resolvePasswordAuth } from "./PasswordAuth.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
@@ -704,6 +705,7 @@ export const make = Effect.gen(function* () {
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
+  const passwordAuth = yield* resolvePasswordAuth(config);
 
   const authenticateToken = (
     token: string,
@@ -863,9 +865,37 @@ export const make = Effect.gen(function* () {
             Effect.catchIf(SessionStore.isSessionCredentialInvalidError, () => Effect.void),
             Effect.mapError((cause) => new ServerAuthSessionCredentialValidationError({ cause })),
           );
-    const grant = yield* bootstrapCredentials
-      .consume(credential)
-      .pipe(Effect.mapError(toBootstrapExchangeError));
+    if (passwordAuth !== undefined && (yield* passwordAuth.matches(credential))) {
+      const session = yield* sessions
+        .issue({
+          method: "browser-session-cookie",
+          subject: "password",
+          scopes: AuthStandardClientScopes,
+          ...(previousSession?.method === "browser-session-cookie"
+            ? { replaceSessionId: previousSession.sessionId }
+            : {}),
+          client: {
+            ...requestMetadata,
+            label: "Password login",
+          },
+        })
+        .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })));
+      return {
+        response: {
+          authenticated: true,
+          ...authScopeResponse(session.scopes),
+          sessionMethod: session.method,
+          expiresAt: DateTime.toUtc(session.expiresAt),
+        } satisfies AuthBrowserSessionResult,
+        sessionToken: session.token,
+      } satisfies BootstrapExchangeResult;
+    }
+    const grant = yield* bootstrapCredentials.consume(credential).pipe(
+      Effect.mapError(toBootstrapExchangeError),
+      Effect.tapError(() =>
+        passwordAuth === undefined ? Effect.void : passwordAuth.recordFailure,
+      ),
+    );
     const session = yield* sessions
       .issue({
         method: "browser-session-cookie",
@@ -895,7 +925,7 @@ export const make = Effect.gen(function* () {
     PairingGrantStore.BootstrapGrant,
     "scopes" | "subject" | "label"
   > & {
-    readonly method: PairingGrantStore.BootstrapGrant["method"] | "reusable-dev-token";
+    readonly method: PairingGrantStore.BootstrapGrant["method"] | "reusable-dev-token" | "password";
   };
   const resolveBootstrapGrant = (
     credential: string,
@@ -908,34 +938,51 @@ export const make = Effect.gen(function* () {
     ResolvedBootstrapGrant,
     ServerAuthInvalidCredentialError | ServerAuthInternalError | ServerAuthScopeNotGrantedError
   > => {
-    if (!devAuth?.matches(credential)) {
-      return bootstrapCredentials
-        .consume(credential, input)
-        .pipe(
-          Effect.mapError((cause) =>
-            cause._tag === "BootstrapCredentialScopeNotGrantedError"
-              ? new ServerAuthScopeNotGrantedError({})
-              : toBootstrapExchangeError(cause),
-          ),
-        );
+    if (devAuth?.matches(credential)) {
+      return sessions.verify(credential).pipe(
+        mapSessionVerificationErrors,
+        Effect.filterOrFail(
+          (session) =>
+            input?.requiredScopes === undefined ||
+            input.requiredScopes.every((scope) => session.scopes.includes(scope)),
+          () => new ServerAuthScopeNotGrantedError({}),
+        ),
+        Effect.map(
+          (session) =>
+            ({
+              method: "reusable-dev-token",
+              scopes: session.scopes,
+              subject: "reusable-dev-token-child",
+            }) satisfies ResolvedBootstrapGrant,
+        ),
+      );
     }
-    return sessions.verify(credential).pipe(
-      mapSessionVerificationErrors,
-      Effect.filterOrFail(
-        (session) =>
-          input?.requiredScopes === undefined ||
-          input.requiredScopes.every((scope) => session.scopes.includes(scope)),
-        () => new ServerAuthScopeNotGrantedError({}),
-      ),
-      Effect.map(
-        (session) =>
-          ({
-            method: "reusable-dev-token",
-            scopes: session.scopes,
-            subject: "reusable-dev-token-child",
-          }) satisfies ResolvedBootstrapGrant,
-      ),
-    );
+    return Effect.gen(function* () {
+      if (passwordAuth !== undefined && (yield* passwordAuth.matches(credential))) {
+        const grant: ResolvedBootstrapGrant = {
+          method: "password",
+          scopes: AuthStandardClientScopes,
+          subject: "password",
+        };
+        return yield* Effect.filterOrFail(
+          Effect.succeed(grant),
+          (candidate) =>
+            input?.requiredScopes === undefined ||
+            input.requiredScopes.every((scope) => candidate.scopes.includes(scope)),
+          () => new ServerAuthScopeNotGrantedError({}),
+        );
+      }
+      return yield* bootstrapCredentials.consume(credential, input).pipe(
+        Effect.mapError((cause) =>
+          cause._tag === "BootstrapCredentialScopeNotGrantedError"
+            ? new ServerAuthScopeNotGrantedError({})
+            : toBootstrapExchangeError(cause),
+        ),
+        Effect.tapError(() =>
+          passwordAuth === undefined ? Effect.void : passwordAuth.recordFailure,
+        ),
+      );
+    });
   };
 
   const exchangeBootstrapCredentialForAccessToken: EnvironmentAuth["Service"]["exchangeBootstrapCredentialForAccessToken"] =

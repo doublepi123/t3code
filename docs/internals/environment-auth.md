@@ -124,6 +124,15 @@ back to the reusable credential. OAuth exchanges create ordinary local bearer
 or DPoP children with normal expiry and revocation. The reusable cookie expires
 after 30 days.
 
+### Server password
+
+A configured `T3CODE_AUTH_PASSWORD` (8+ characters) is a reusable bootstrap
+credential in any mode: it logs a browser in and works in place of a pairing
+code, minting ordinary revocable 30-day sessions. Failed attempts are throttled
+in memory (10 per 5 minutes per process) without affecting pairing tokens.
+Rotating the password does not revoke existing sessions; use
+`t3 auth session revoke`.
+
 ## The environment is the filesystem boundary
 
 Projects are organizational boundaries, not filesystem sandboxes.

@@ -10,9 +10,11 @@ import {
 } from "@t3tools/shared/dpop";
 import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -775,6 +777,139 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       }
     }).pipe(
       Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: "desktop-bootstrap-token" })),
+    ),
+  );
+
+  it.effect(
+    "signs a browser in with the configured password and reuses it for another device",
+    () =>
+      Effect.gen(function* () {
+        const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+        const sessions = yield* SessionStore.SessionStore;
+        const password = "correct-horse-password";
+        const now = yield* DateTime.now;
+        const first = yield* serverAuth.createBrowserSession(password, requestMetadata);
+        const firstSession = yield* sessions.verify(first.sessionToken);
+
+        expect(firstSession.method).toBe("browser-session-cookie");
+        expect(firstSession.subject).toBe("password");
+        expect(firstSession.scopes).toEqual(AuthStandardClientScopes);
+        const expiresAt = firstSession.expiresAt;
+        if (expiresAt === undefined) {
+          return yield* Effect.die("Expected password sessions to expire.");
+        }
+        expect(Math.round((expiresAt.epochMilliseconds - now.epochMilliseconds) / 86_400_000)).toBe(
+          30,
+        );
+        expect(first.response).toMatchObject(authScopeResponse(AuthStandardClientScopes));
+
+        const authenticated = yield* serverAuth.authenticateHttpRequest(
+          makeCookieRequest(sessions.cookieName, first.sessionToken),
+        );
+        expect(authenticated.subject).toBe("password");
+
+        const second = yield* serverAuth.createBrowserSession(password, {
+          ...requestMetadata,
+          deviceType: "mobile",
+          label: "iPhone",
+        });
+        const secondSession = yield* sessions.verify(second.sessionToken);
+        expect(secondSession.subject).toBe("password");
+        expect(secondSession.sessionId).not.toBe(firstSession.sessionId);
+
+        const listed = yield* serverAuth.listSessions();
+        expect(listed.map((entry) => entry.sessionId)).toEqual(
+          expect.arrayContaining([firstSession.sessionId, secondSession.sessionId]),
+        );
+      }).pipe(
+        Effect.provide(
+          layerEnvironmentAuth({ authPassword: Redacted.make("correct-horse-password") }),
+        ),
+      ),
+  );
+
+  it.effect("rejects an incorrect password", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const error = yield* Effect.flip(
+        serverAuth.createBrowserSession("wrong-password", requestMetadata),
+      );
+
+      expect(error._tag).toBe("ServerAuthInvalidCredentialError");
+    }).pipe(
+      Effect.provide(
+        layerEnvironmentAuth({ authPassword: Redacted.make("correct-horse-password") }),
+      ),
+    ),
+  );
+
+  it.effect("throttles password login after ten failures until the window passes", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const password = "correct-horse-password";
+
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const error = yield* Effect.flip(
+          serverAuth.createBrowserSession("wrong-password", requestMetadata),
+        );
+        expect(error._tag).toBe("ServerAuthInvalidCredentialError");
+      }
+
+      const throttled = yield* Effect.flip(
+        serverAuth.createBrowserSession(password, requestMetadata),
+      );
+      expect(throttled._tag).toBe("ServerAuthInvalidCredentialError");
+
+      const pairing = yield* serverAuth.issuePairingCredential({
+        scopes: ["orchestration:read"],
+      });
+      const paired = yield* serverAuth.createBrowserSession(pairing.credential, requestMetadata);
+      expect(paired.response.authenticated).toBe(true);
+
+      yield* TestClock.adjust(Duration.minutes(5));
+
+      const recovered = yield* serverAuth.createBrowserSession(password, requestMetadata);
+      expect(recovered.response.authenticated).toBe(true);
+    }).pipe(
+      Effect.provide(
+        layerEnvironmentAuth({ authPassword: Redacted.make("correct-horse-password") }),
+      ),
+    ),
+  );
+
+  it.effect("exchanges the configured password for independent bearer sessions", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const password = "correct-horse-password";
+
+      const first = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        password,
+        ["orchestration:read"],
+        requestMetadata,
+      );
+      const second = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
+        password,
+        undefined,
+        { ...requestMetadata, deviceType: "mobile" },
+      );
+      const firstSession = yield* serverAuth.authenticateHttpRequest(
+        makeBearerRequest(first.access_token),
+      );
+      const secondSession = yield* serverAuth.authenticateHttpRequest(
+        makeBearerRequest(second.access_token),
+      );
+
+      expect(first.token_type).toBe("Bearer");
+      expect(first.scope).toBe("orchestration:read");
+      expect(firstSession.subject).toBe("password");
+      expect(firstSession.scopes).toEqual(["orchestration:read"]);
+      expect(secondSession.subject).toBe("password");
+      expect(secondSession.scopes).toEqual(AuthStandardClientScopes);
+    }).pipe(
+      Effect.provide(
+        layerEnvironmentAuth({ authPassword: Redacted.make("correct-horse-password") }),
+      ),
     ),
   );
 });

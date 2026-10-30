@@ -2,6 +2,7 @@ import { AuthEnvironmentMaintainScope, type ServerAuthDescriptor } from "@t3tool
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -49,6 +50,9 @@ export const make = Effect.gen(function* () {
       environmentId: yield* serverEnvironment.getEnvironmentId,
       development: config.devUrl !== undefined,
     }),
+    ...(config.authPassword !== undefined && Redacted.value(config.authPassword).length > 0
+      ? { passwordLogin: true }
+      : {}),
   };
 
   return EnvironmentAuthPolicy.of({

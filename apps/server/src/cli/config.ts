@@ -187,6 +187,27 @@ const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
   Config.map(Option.getOrUndefined),
 );
 
+const AuthPasswordConfig = Config.Redacted("T3CODE_AUTH_PASSWORD").pipe(
+  Config.map((password) => Redacted.make(Redacted.value(password).trim())),
+  Config.mapEffect((password) => {
+    const value = Redacted.value(password);
+    return value.length === 0 || value.length >= 8
+      ? Effect.succeed(password)
+      : Effect.fail(
+          new Config.ConfigError(
+            new Schema.SchemaError(
+              new SchemaIssue.InvalidValue({
+                message: "T3CODE_AUTH_PASSWORD must contain at least 8 characters.",
+              }),
+            ),
+          ),
+        );
+  }),
+  Config.option,
+  Config.map(Option.filter((password) => Redacted.value(password).length > 0)),
+  Config.map(Option.getOrUndefined),
+);
+
 export interface CliServerFlags {
   readonly mode: Option.Option<ServerConfig.RuntimeMode>;
   readonly port: Option.Option<number>;
@@ -316,6 +337,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
   );
   const devAuthToken =
     mode === "web" && devUrl !== undefined ? yield* DevAuthTokenConfig : undefined;
+  const authPassword = yield* AuthPasswordConfig;
   const explicitBaseDir = resolveOptionPrecedence(
     normalizedFlags.baseDir,
     Option.fromUndefinedOr(env.t3Home),
@@ -491,6 +513,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     staticDir,
     devUrl,
     ...(devAuthToken === undefined ? {} : { devAuthToken }),
+    ...(authPassword === undefined ? {} : { authPassword }),
     devAllowedOrigins: env.devAllowedOrigins,
     noBrowser,
     startupPresentation,

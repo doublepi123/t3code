@@ -40,6 +40,7 @@ export function PairingRouteSurface({
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
+  const passwordLogin = auth.passwordLogin === true;
 
   const submitCredential = async (nextCredential: string) => {
     setIsSubmitting(true);
@@ -85,24 +86,29 @@ export function PairingRouteSurface({
   return (
     <StandalonePage>
       <StandalonePageHeader
-        title="Pair with this environment"
-        description={describeAuthGate(auth.bootstrapMethods)}
+        title={passwordLogin ? "Sign in to this environment" : "Pair with this environment"}
+        description={describeAuthGate(auth.bootstrapMethods, passwordLogin)}
       />
 
       <form className="mt-6 space-y-4" onSubmit={(event) => void handleSubmit(event)}>
         <div className="space-y-2">
           <label className="text-sm font-medium" htmlFor="pairing-token">
-            Pairing token
+            {passwordLogin ? "Password" : "Pairing token"}
           </label>
           <Input
             id="pairing-token"
             autoCapitalize="none"
-            autoComplete="off"
+            autoComplete={passwordLogin ? "current-password" : "off"}
             autoCorrect="off"
             disabled={isSubmitting}
+            {...(passwordLogin ? { name: "password", type: "password" } : {})}
             nativeInput
             onChange={(event) => setCredential(event.currentTarget.value)}
-            placeholder="Paste a one-time token or pairing secret"
+            placeholder={
+              passwordLogin
+                ? "Server password or pairing token"
+                : "Paste a one-time token or pairing secret"
+            }
             spellCheck={false}
             value={credential}
           />
@@ -116,7 +122,7 @@ export function PairingRouteSurface({
 
         <div className="flex flex-wrap gap-2">
           <Button disabled={isSubmitting} size="sm" type="submit">
-            {isSubmitting ? "Pairing..." : "Continue"}
+            {isSubmitting ? (passwordLogin ? "Signing in..." : "Pairing...") : "Continue"}
           </Button>
           <Button
             disabled={isSubmitting}
@@ -130,7 +136,7 @@ export function PairingRouteSurface({
       </form>
 
       <div className="mt-6 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
-        {describeSupportedMethods(auth.bootstrapMethods)}
+        {describeSupportedMethods(auth.bootstrapMethods, passwordLogin)}
       </div>
     </StandalonePage>
   );
@@ -266,7 +272,11 @@ function errorMessageFromUnknown(error: unknown): string {
   return "Authentication failed.";
 }
 
-function describeAuthGate(bootstrapMethods: ReadonlyArray<string>): string {
+function describeAuthGate(bootstrapMethods: ReadonlyArray<string>, passwordLogin: boolean): string {
+  if (passwordLogin) {
+    return "Enter the server password to start a session with this environment.";
+  }
+
   if (bootstrapMethods.includes("desktop-bootstrap")) {
     return "This environment expects a trusted pairing credential before the app can connect.";
   }
@@ -274,7 +284,14 @@ function describeAuthGate(bootstrapMethods: ReadonlyArray<string>): string {
   return "Enter a pairing token to start a session with this environment.";
 }
 
-function describeSupportedMethods(bootstrapMethods: ReadonlyArray<string>): string {
+function describeSupportedMethods(
+  bootstrapMethods: ReadonlyArray<string>,
+  passwordLogin: boolean,
+): string {
+  if (passwordLogin) {
+    return "Signing in with the password keeps this browser signed in for 30 days. You can also paste a pairing token here, and pairing links still open this page directly.";
+  }
+
   if (
     bootstrapMethods.includes("desktop-bootstrap") &&
     bootstrapMethods.includes("one-time-token")
