@@ -1,0 +1,156 @@
+name: Fork release
+
+# Builds the Linux x64 CLI archive for doublepi123/t3code and publishes it as a
+# GitHub release, which `t3 update` on fork installs discovers and downloads.
+# Every push to main releases the next `-pw.<n>` after the newest such tag.
+# A pushed `v<x.y.z>-pw.<n>` tag releases that version; a manual run may name one.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*-pw.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the v prefix, e.g. 0.1.6-pw.3. Empty bumps the newest -pw tag."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Linux x64 CLI
+    if: github.repository == 'doublepi123/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Public values the official builds embed for T3 Connect sign-in.
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+      T3CODE_RELAY_URL: https://relay.t3.codes
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            create_tag=false
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            version="${INPUT_VERSION#v}"
+            create_tag=true
+          else
+            # Follow the upstream package version when it moves past the newest -pw tag.
+            latest="$(git ls-remote --tags --refs origin 'v*-pw.*' \
+              | sed -E 's#.*refs/tags/v##' | sort -V | tail -n 1)"
+            package="$(node -p 'require("./apps/server/package.json").version.split("-")[0]')"
+            latest_core="${latest%-pw.*}"
+            if [[ -z "$latest" ]] || [[ "$(printf '%s\n%s\n' "$latest_core" "$package" | sort -V | tail -n 1)" != "$latest_core" ]]; then
+              version="$package-pw.1"
+            else
+              version="$latest_core-pw.$(( ${latest##*.} + 1 ))"
+            fi
+            create_tag=true
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-pw\.[0-9]+$ ]]; then
+            echo "Version must look like 0.1.6-pw.3, got '$version'." >&2
+            exit 1
+          fi
+          if [[ "$create_tag" == true ]] && git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "Tag v$version already exists." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version from $GITHUB_SHA"
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+          mkdir -p "$RUNNER_TEMP/cli-resource-monitor"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$RUNNER_TEMP/cli-resource-monitor/"
+
+      # The Linux archive ships libatomic.so.1 and points t3's RUNPATH at it.
+      - name: Install patchelf
+        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ steps.version.outputs.version }}"
+
+      # t3#build depends on @t3tools/web#build and copies the client into apps/server/dist.
+      - name: Build server and web client
+        run: vp run --filter t3 build
+
+      - name: Apply web client branding
+        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build CLI single-executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform linux \
+            --arch x64 \
+            --version "${{ steps.version.outputs.version }}" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/t3-*.tar.gz --expect-version "${{ steps.version.outputs.version }}"
+
+      - name: Write checksums
+        working-directory: release-cli
+        run: sha256sum t3-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CREATE_TAG: ${{ steps.version.outputs.create_tag }}
+        run: |
+          set -euo pipefail
+          notes="Fork build of ${GITHUB_SHA::10}. Linux x64 CLI only; install with \`t3 update\`."
+          args=(--title "v$VERSION" --notes "$notes")
+          if [[ "$CREATE_TAG" == true ]]; then
+            args+=(--target "$GITHUB_SHA")
+          else
+            args+=(--verify-tag)
+          fi
+          gh release create "v$VERSION" "${args[@]}" release-cli/t3-*.tar.gz release-cli/SHA256SUMS
