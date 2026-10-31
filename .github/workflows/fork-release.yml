@@ -1,9 +1,10 @@
 name: Fork release
 
-# Builds the Linux x64 CLI archive for doublepi123/t3code and publishes it as a
-# GitHub release, which `t3 update` on fork installs discovers and downloads.
-# Every push to main releases the next `-pw.<n>` after the newest such tag.
-# A pushed `v<x.y.z>-pw.<n>` tag releases that version; a manual run may name one.
+# Builds every release target for doublepi123/t3code and publishes one GitHub
+# release: the CLI archives `t3 update` installs, plus unsigned desktop apps whose
+# updater follows this repository. Every push to main releases the next
+# `<x.y.z>-pw.<n>`; a pushed `v*-pw.*` tag or a manual run can pin the version.
+# Desktop and CLI targets reuse release-desktop.yml on GitHub-hosted runners.
 
 on:
   push:
@@ -14,37 +15,40 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version without the v prefix, e.g. 0.1.6-pw.3. Empty bumps the newest -pw tag."
+        description: "Version without the v prefix, e.g. 0.1.6-pw.9. Empty bumps the newest -pw tag."
         required: false
         default: ""
 
 permissions:
+  # release-desktop.yml reads this run's artifacts to hand Windows the Linux CLI archive.
+  actions: read
   contents: write
 
 concurrency:
   group: fork-release
   cancel-in-progress: false
 
+env:
+  # Public values the official builds embed for T3 Connect sign-in.
+  T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+  T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+  T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+  T3CODE_RELAY_URL: https://relay.t3.codes
+
 jobs:
-  release:
-    name: Build and publish Linux x64 CLI
+  prepare:
+    name: Resolve version
     if: github.repository == 'doublepi123/t3code'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      # Public values the official builds embed for T3 Connect sign-in.
-      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
-      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
-      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
-      T3CODE_RELAY_URL: https://relay.t3.codes
-      NODE_OPTIONS: --max-old-space-size=8192
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      create_tag: ${{ steps.version.outputs.create_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          sparse-checkout: |
-            /*
-            !/.repos/
+          sparse-checkout: apps/server/package.json
           sparse-checkout-cone-mode: false
 
       - name: Resolve version
@@ -52,7 +56,6 @@ jobs:
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -86,71 +89,306 @@ jobs:
           echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
           echo "Releasing $version from $GITHUB_SHA"
 
+  # Server bundle, web client and Electron main, built once and shared by every target.
+  bundle:
+    name: Build JS bundle
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
-          install-args: --filter=t3... --filter=@t3tools/scripts...
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.prepare.outputs.version }}"
+
+      # @t3tools/desktop#build compiles the Linux browser secret helper and needs libsecret headers.
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
         with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-gnu
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Build resource monitor
+  desktop_linux_x64:
+    name: Desktop Linux x64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: Linux x64
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+      launch_check: true
+
+  # node-pty has no Linux prebuild, so arm64 builds on arm64 hardware.
+  desktop_linux_arm64:
+    name: Desktop Linux arm64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: Linux arm64
+      runner: ubuntu-24.04-arm
+      platform: linux
+      target: AppImage
+      arch: arm64
+      rust_target: aarch64-unknown-linux-gnu
+      resource_key: linux-arm64
+      cli_archive: true
+
+  desktop_mac_arm64:
+    name: Desktop macOS arm64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: macOS arm64
+      runner: macos-15
+      platform: mac
+      target: dmg
+      arch: arm64
+      rust_target: aarch64-apple-darwin
+      resource_key: darwin-arm64
+      cli_archive: true
+      launch_check: true
+
+  # Node single-executables do not run on x64 macOS, so this target ships only the app.
+  desktop_mac_x64:
+    name: Desktop macOS x64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: macOS x64
+      runner: macos-15
+      platform: mac
+      target: dmg
+      arch: x64
+      rust_target: x86_64-apple-darwin
+      resource_key: darwin-x64
+      cli_archive: false
+
+  # Windows packages on Linux, embeds the same-arch Linux CLI archive for WSL,
+  # and runs its native checks on a Windows runner.
+  desktop_win_x64:
+    name: Desktop Windows x64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: Windows x64
+      runner: ubuntu-24.04
+      verify_runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: true
+
+  desktop_win_arm64:
+    name: Desktop Windows arm64
+    needs: [prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      label: Windows arm64
+      runner: ubuntu-24.04
+      verify_runner: windows-11-arm
+      platform: win
+      target: nsis
+      arch: arm64
+      rust_target: aarch64-pc-windows-msvc
+      resource_key: win32-arm64
+      cli_archive: true
+
+  # Publishes once the Linux x64 server build exists, so a broken desktop target
+  # never blocks server updates; any target that failed is simply missing.
+  release:
+    name: Publish GitHub Release
+    needs:
+      [
+        prepare,
+        desktop_linux_x64,
+        desktop_linux_arm64,
+        desktop_mac_arm64,
+        desktop_mac_x64,
+        desktop_win_x64,
+        desktop_win_arm64,
+      ]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.desktop_linux_x64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/scripts...
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Write CLI archive checksums
+        working-directory: release-assets
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
-          mkdir -p "$RUNNER_TEMP/cli-resource-monitor"
-          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$RUNNER_TEMP/cli-resource-monitor/"
+          shopt -s nullglob
+          archives=(t3-*.tar.gz t3-*.zip)
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
 
-      # The Linux archive ships libatomic.so.1 and points t3's RUNPATH at it.
-      - name: Install patchelf
-        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
-
-      - name: Align package versions to release version
-        run: node scripts/update-release-package-versions.ts "${{ steps.version.outputs.version }}"
-
-      # t3#build depends on @t3tools/web#build and copies the client into apps/server/dist.
-      - name: Build server and web client
-        run: vp run --filter t3 build
-
-      - name: Apply web client branding
-        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
-
-      - name: Build CLI single-executable
-        run: node apps/server/scripts/cli.ts build-exe --verbose
-
-      - name: Build CLI archive
+      # electron-updater reads one manifest per platform, so per-arch manifests merge back into one.
+      - name: Merge updater manifests
+        shell: bash
         run: |
-          node scripts/build-cli-archive.ts \
-            --platform linux \
-            --arch x64 \
-            --version "${{ steps.version.outputs.version }}" \
-            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
-            --output-dir release-cli
-
-      - name: Smoke-test CLI archive
-        run: node scripts/smoke-cli-archive.ts --archive release-cli/t3-*.tar.gz --expect-version "${{ steps.version.outputs.version }}"
-
-      - name: Write checksums
-        working-directory: release-cli
-        run: sha256sum t3-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+          set -euo pipefail
+          shopt -s nullglob
+          for x64_manifest in release-assets/*-mac-x64.yml; do
+            arm64_manifest="${x64_manifest%-x64.yml}.yml"
+            if [[ -f "$arm64_manifest" ]]; then
+              node scripts/merge-update-manifests.ts --platform mac "$arm64_manifest" "$x64_manifest"
+              rm -f "$x64_manifest"
+            else
+              mv "$x64_manifest" "$arm64_manifest"
+            fi
+          done
+          for x64_manifest in release-assets/*-win-x64.yml; do
+            arm64_manifest="${x64_manifest%-x64.yml}-arm64.yml"
+            merged_manifest="${x64_manifest%-win-x64.yml}.yml"
+            if [[ -f "$arm64_manifest" ]]; then
+              node scripts/merge-update-manifests.ts --platform win "$x64_manifest" "$arm64_manifest" "$merged_manifest"
+              rm -f "$x64_manifest" "$arm64_manifest"
+            else
+              mv "$x64_manifest" "$merged_manifest"
+            fi
+          done
+          for arm64_manifest in release-assets/*-win-arm64.yml; do
+            mv "$arm64_manifest" "${arm64_manifest%-win-arm64.yml}.yml"
+          done
+          rm -f release-assets/builder-debug.yml
+          ls -la release-assets
 
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          CREATE_TAG: ${{ steps.version.outputs.create_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CREATE_TAG: ${{ needs.prepare.outputs.create_tag }}
+          RESULTS: >-
+            Linux x64 ${{ needs.desktop_linux_x64.result }},
+            Linux arm64 ${{ needs.desktop_linux_arm64.result }},
+            macOS arm64 ${{ needs.desktop_mac_arm64.result }},
+            macOS x64 ${{ needs.desktop_mac_x64.result }},
+            Windows x64 ${{ needs.desktop_win_x64.result }},
+            Windows arm64 ${{ needs.desktop_win_arm64.result }}
         run: |
           set -euo pipefail
-          notes="Fork build of ${GITHUB_SHA::10}. Linux x64 CLI only; install with \`t3 update\`."
-          args=(--title "v$VERSION" --notes "$notes")
+          notes="Fork build of ${GITHUB_SHA::10}. Unsigned desktop apps. Servers update with \`t3 update\`.
+
+          Targets: ${RESULTS}."
+          args=(--title "v$VERSION" --notes "$notes" --latest)
           if [[ "$CREATE_TAG" == true ]]; then
             args+=(--target "$GITHUB_SHA")
           else
             args+=(--verify-tag)
           fi
-          gh release create "v$VERSION" "${args[@]}" release-cli/t3-*.tar.gz release-cli/SHA256SUMS
+          shopt -s nullglob
+          files=(release-assets/*.dmg release-assets/*.zip release-assets/*.AppImage release-assets/*.deb \
+            release-assets/*.exe release-assets/*.blockmap release-assets/*.yml release-assets/*.tar.gz \
+            release-assets/SHA256SUMS)
+          gh release create "v$VERSION" "${args[@]}" "${files[@]}"
