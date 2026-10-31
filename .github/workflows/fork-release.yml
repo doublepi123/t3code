@@ -131,6 +131,53 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The Android app runs this bundle with Alpine's nodejs inside PRoot, so it is
+  # built on musl for each architecture: node-pty has no musl prebuild and every
+  # native external must match the target CPU, which rules out cross builds.
+  android_server:
+    name: Android server ${{ matrix.arch }}
+    needs: [prepare, bundle]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Build Android server bundle
+        run: |
+          ./scripts/build-android-server-bundle.sh \
+            --dist apps/server/dist \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --arch "${{ matrix.arch }}" \
+            --output-dir android-server-bundle
+
+      - name: Upload Android server bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-server-${{ matrix.arch }}
+          path: android-server-bundle/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   desktop_linux_x64:
     name: Desktop Linux x64
     needs: [prepare, bundle]
@@ -284,6 +331,7 @@ jobs:
     needs:
       [
         prepare,
+        android_server,
         desktop_linux_x64,
         desktop_linux_arm64,
         desktop_mac_arm64,
@@ -319,6 +367,16 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      # Optional like the desktop targets: when both matrix legs fail there is no
+      # artifact to download, and the release still publishes without it.
+      - name: Download Android server bundles
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: android-server-*
           merge-multiple: true
           path: release-assets
 
@@ -370,6 +428,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           CREATE_TAG: ${{ needs.prepare.outputs.create_tag }}
           RESULTS: >-
+            Android server ${{ needs.android_server.result }},
             Linux x64 ${{ needs.desktop_linux_x64.result }},
             Linux arm64 ${{ needs.desktop_linux_arm64.result }},
             macOS arm64 ${{ needs.desktop_mac_arm64.result }},
